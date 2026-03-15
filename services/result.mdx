@@ -1,0 +1,214 @@
+---
+title: 'Result'
+description: 'Node.js Express app that displays live vote tallies using Socket.IO.'
+icon: 'chart-bar'
+---
+
+The Result service is the read-facing frontend of the voting application. It connects directly to PostgreSQL, queries the current vote counts every second, and pushes updates to connected browsers via Socket.IO — no page refresh required.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Language" icon="node-js">
+    Node.js 18 with Express
+  </Card>
+  <Card title="Real-time" icon="bolt">
+    Socket.IO — emits `scores` every 1 s
+  </Card>
+  <Card title="Database" icon="database">
+    PostgreSQL — reads from `votes` table
+  </Card>
+  <Card title="Port mapping" icon="network-wired">
+    Host `8081` → container `80`
+  </Card>
+</CardGroup>
+
+## Port mapping
+
+| Host port       | Container port | Protocol | Notes                          |
+|-----------------|----------------|----------|--------------------------------|
+| 8081            | 80             | HTTP     | Browser UI                     |
+| 127.0.0.1:9229  | 9229           | TCP      | Node.js inspector (dev only)   |
+
+<Note>
+  Port 9229 is bound to `127.0.0.1` on the host only, limiting remote debugger access to the local machine.
+</Note>
+
+## Real-time score updates
+
+After successfully connecting to PostgreSQL, `server.js` enters an infinite polling loop. Every 1 000 ms it executes a `GROUP BY` query and broadcasts the result to all connected Socket.IO clients.
+
+```javascript server.js
+function getVotes(client) {
+  client.query('SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote', [], function(err, result) {
+    if (err) {
+      console.error("Error performing query: " + err);
+    } else {
+      var votes = collectVotesFromResult(result);
+      io.sockets.emit("scores", JSON.stringify(votes));
+    }
+
+    setTimeout(function() {getVotes(client) }, 1000);
+  });
+}
+```
+
+The payload emitted on the `scores` event is a JSON-serialised object:
+
+```json
+{"a": 42, "b": 17}
+```
+
+Where `a` and `b` correspond to votes for `OPTION_A` and `OPTION_B` respectively.
+
+## Socket.IO events
+
+| Event       | Direction        | Payload                      | Description                                  |
+|-------------|------------------|------------------------------|----------------------------------------------|
+| `message`   | Server → client  | `{ text: "Welcome!" }`       | Sent immediately on connection               |
+| `subscribe` | Client → server  | `{ channel: "<name>" }`      | Joins the client to a named channel          |
+| `scores`    | Server → client  | `{ a: <count>, b: <count> }` | Current vote totals, broadcast every 1 s     |
+
+```javascript server.js
+io.on('connection', function (socket) {
+  socket.emit('message', { text : 'Welcome!' });
+
+  socket.on('subscribe', function (data) {
+    socket.join(data.channel);
+  });
+});
+```
+
+## PostgreSQL query
+
+```sql
+SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote
+```
+
+Returns one row per distinct vote value (`a` or `b`) with a count of unique voter IDs. The `collectVotesFromResult` helper normalises the rows into the `{a, b}` shape expected by the frontend.
+
+```javascript server.js
+function collectVotesFromResult(result) {
+  var votes = {a: 0, b: 0};
+
+  result.rows.forEach(function (row) {
+    votes[row.vote] = parseInt(row.count);
+  });
+
+  return votes;
+}
+```
+
+## Database connection and retry
+
+The service uses `async.retry` to wait for PostgreSQL to become available before starting the polling loop. It retries up to 1 000 times with a 1-second interval between attempts.
+
+```javascript server.js
+var pool = new Pool({
+  connectionString: 'postgres://postgres:postgres@db/postgres'
+});
+
+async.retry(
+  {times: 1000, interval: 1000},
+  function(callback) {
+    pool.connect(function(err, client, done) {
+      if (err) {
+        console.error("Waiting for db");
+      }
+      callback(err, client);
+    });
+  },
+  function(err, client) {
+    if (err) {
+      return console.error("Giving up");
+    }
+    console.log("Connected to db");
+    getVotes(client);
+  }
+);
+```
+
+<Warning>
+  After 1 000 failed attempts the service logs "Giving up" and stops trying. Ensure the `db` service is healthy before the Result service exhausts its retries in production deployments.
+</Warning>
+
+## Dependencies
+
+```json package.json
+{
+  "dependencies": {
+    "async": "^3.1.0",
+    "cookie-parser": "^1.4.6",
+    "express": "^4.18.2",
+    "method-override": "^3.0.0",
+    "pg": "^8.8.0",
+    "socket.io": "^4.7.2",
+    "stoppable": "^1.1.0"
+  }
+}
+```
+
+| Package         | Role                                              |
+|-----------------|---------------------------------------------------|
+| `express`       | HTTP server and static file serving               |
+| `socket.io`     | WebSocket-based real-time event transport         |
+| `pg`            | PostgreSQL client (`Pool` for connection pooling) |
+| `async`         | `async.retry` for database connection retries     |
+| `cookie-parser` | Cookie parsing middleware                         |
+| `method-override` | HTTP method override support                  |
+| `stoppable`     | Graceful server shutdown helper                   |
+
+## Dockerfile
+
+```dockerfile result/Dockerfile
+FROM node:18-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl tini && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/local/app
+
+RUN npm install -g nodemon
+
+COPY package*.json ./
+RUN npm ci && \
+    npm cache clean --force && \
+    mv /usr/local/app/node_modules /node_modules
+
+COPY . .
+
+ENV PORT=80
+EXPOSE 80
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "server.js"]
+```
+
+`tini` is used as PID 1 to ensure proper signal handling and zombie process reaping.
+
+## Development mode
+
+In `docker-compose.yml`, the default `node server.js` command is overridden with `nodemon` for hot-reloading and the Node.js inspector for remote debugging:
+
+```yaml docker-compose.yml
+result:
+  build: ./result
+  entrypoint: nodemon --inspect=0.0.0.0 server.js
+  ports:
+    - "8081:80"
+    - "127.0.0.1:9229:9229"
+  volumes:
+    - ./result:/usr/local/app
+```
+
+<Tip>
+  Attach a debugger to `localhost:9229` using Chrome DevTools or any Node.js-compatible IDE to step through live server code during development.
+</Tip>
+
+## Networks
+
+The Result service is attached to both Compose networks:
+
+- **front-tier** — reachable from the host browser on port 8081.
+- **back-tier** — required to reach the `db` (PostgreSQL) service.

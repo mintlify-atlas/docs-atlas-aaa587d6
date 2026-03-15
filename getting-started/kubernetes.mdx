@@ -1,0 +1,94 @@
+---
+title: 'Kubernetes'
+description: 'Deploy the Example Voting App to a Kubernetes cluster using the provided manifests.'
+keywords: ['kubernetes', 'kubectl', 'deployment', 'nodeport', 'voting app']
+---
+
+The `k8s-specifications/` directory contains nine Kubernetes manifest files that create all the deployments and services needed to run the Example Voting App on any standard Kubernetes cluster.
+
+## Prerequisites
+
+- A running Kubernetes cluster (local or remote)
+- `kubectl` installed and configured to point at your cluster
+
+<Tip>
+  For a quick local cluster, [Docker Desktop](https://www.docker.com/products/docker-desktop) includes a built-in single-node Kubernetes option you can enable in Settings.
+</Tip>
+
+## Deploy the app
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
+
+  <Step title="Apply all manifests">
+    Create all deployments and services in a single command:
+
+    ```bash
+    kubectl create -f k8s-specifications/
+    ```
+
+    Kubernetes reads every file in the `k8s-specifications/` directory and creates the resources in your current namespace (`default` unless you have changed it).
+  </Step>
+
+  <Step title="Check that pods are running">
+    ```bash
+    kubectl get pods
+    ```
+
+    Wait until all pods show a `Running` status before accessing the app.
+  </Step>
+
+  <Step title="Open the app in your browser">
+    Both frontend services are exposed as `NodePort` services. Access them on any node in your cluster:
+
+    <CardGroup cols={2}>
+      <Card title="Vote" icon="check-square" href="http://localhost:31000">
+        Cast your vote on port `31000`
+      </Card>
+      <Card title="Results" icon="chart-bar" href="http://localhost:31001">
+        View live results on port `31001`
+      </Card>
+    </CardGroup>
+  </Step>
+</Steps>
+
+## Manifest files
+
+The nine files in `k8s-specifications/` create the following resources:
+
+| File                      | Kind         | Name     | Image / Notes                                   |
+| ------------------------- | ------------ | -------- | ----------------------------------------------- |
+| `vote-deployment.yaml`    | Deployment   | `vote`   | `dockersamples/examplevotingapp_vote`            |
+| `vote-service.yaml`       | Service      | `vote`   | NodePort `31000 → 80`, internal port `8080`      |
+| `result-deployment.yaml`  | Deployment   | `result` | `dockersamples/examplevotingapp_result`          |
+| `result-service.yaml`     | Service      | `result` | NodePort `31001 → 80`, internal port `8081`      |
+| `worker-deployment.yaml`  | Deployment   | `worker` | `dockersamples/examplevotingapp_worker`          |
+| `db-deployment.yaml`      | Deployment   | `db`     | `postgres:15-alpine`, `emptyDir` volume          |
+| `db-service.yaml`         | Service      | `db`     | ClusterIP, port `5432`                           |
+| `redis-deployment.yaml`   | Deployment   | `redis`  | `redis:alpine`, `emptyDir` volume                |
+| `redis-service.yaml`      | Service      | `redis`  | ClusterIP, port `6379`                           |
+
+<Note>
+  The `db` and `redis` deployments use `emptyDir` volumes. Data does not persist across pod restarts. For production use, replace these with `PersistentVolumeClaim` resources.
+</Note>
+
+## Namespace
+
+All resources are created in the `default` namespace unless you specify otherwise. To deploy into a different namespace, add `-n <namespace>` to the `kubectl` commands:
+
+```bash
+kubectl create -f k8s-specifications/ -n my-namespace
+```
+
+## Tear down
+
+Delete all resources created by the manifests:
+
+```bash
+kubectl delete -f k8s-specifications/
+```

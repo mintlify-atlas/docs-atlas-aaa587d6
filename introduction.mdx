@@ -1,0 +1,67 @@
+---
+title: "Introduction"
+description: "A simple distributed voting application composed of multiple Docker containers, demonstrating multi-service orchestration with Docker Compose, Docker Swarm, and Kubernetes."
+---
+
+## What is the Example Voting App?
+
+The Example Voting App is a reference implementation of a multi-container distributed application built by Docker. It demonstrates how to architect, containerize, and orchestrate multiple services written in different languages using Docker tooling.
+
+The app lets users vote between two options (default: Cats vs. Dogs) and displays live results in real time. It spans five services across three network tiers, making it an ideal learning resource for understanding container networking, message queues, and persistent storage.
+
+<Note>
+This app is intentionally simple — it's designed to showcase Docker concepts, not production-grade distributed systems design.
+</Note>
+
+## The five services
+
+<CardGroup cols={2}>
+  <Card title="Vote" icon="check-to-slot" href="/services/vote">
+    Python (Flask) web app that accepts votes and pushes them to Redis. Runs on port 8080.
+  </Card>
+  <Card title="Result" icon="chart-bar" href="/services/result">
+    Node.js web app that reads vote counts from PostgreSQL and streams live results via Socket.IO. Runs on port 8081.
+  </Card>
+  <Card title="Worker" icon="gear" href="/services/worker">
+    .NET (C#) background service that dequeues votes from Redis and persists them to PostgreSQL.
+  </Card>
+  <Card title="Redis" icon="database" href="/services/redis">
+    In-memory message queue that buffers incoming votes between the Vote app and the Worker.
+  </Card>
+  <Card title="PostgreSQL" icon="database" href="/services/postgres">
+    Relational database that stores the canonical vote counts read by the Result app.
+  </Card>
+</CardGroup>
+
+## Deployment options
+
+<CardGroup cols={3}>
+  <Card title="Docker Compose" icon="docker" href="/getting-started/docker-compose">
+    Run all five services locally with a single command. Best for development and learning.
+  </Card>
+  <Card title="Docker Swarm" icon="layer-group" href="/getting-started/docker-swarm">
+    Deploy to a Swarm cluster with replicated services. Uses `docker-stack.yml`.
+  </Card>
+  <Card title="Kubernetes" icon="dharmachakra" href="/getting-started/kubernetes">
+    Deploy using the included YAML manifests in `k8s-specifications/`.
+  </Card>
+</CardGroup>
+
+## Technology stack
+
+| Service  | Language / Runtime | Framework      |
+|----------|--------------------|----------------|
+| vote     | Python 3.11        | Flask + Gunicorn |
+| result   | Node.js            | Express + Socket.IO |
+| worker   | .NET (C#)          | Console app    |
+| redis    | —                  | Redis alpine   |
+| db       | —                  | PostgreSQL 15  |
+
+## Key concepts demonstrated
+
+- **Multi-stage Docker builds** — the Vote service uses separate `dev` and `final` build targets
+- **Service dependencies** — Compose health checks ensure services start in the correct order
+- **Message queuing** — votes are buffered in Redis before being written to the database
+- **Real-time streaming** — the Result app uses Socket.IO to push live score updates to browsers
+- **Network segmentation** — front-tier and back-tier networks isolate public-facing from internal services
+- **Configurable options** — vote labels are set via `OPTION_A` and `OPTION_B` environment variables

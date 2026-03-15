@@ -1,0 +1,99 @@
+---
+title: 'Docker Swarm'
+description: 'Deploy the Example Voting App to a Docker Swarm cluster using a stack file.'
+keywords: ['docker swarm', 'stack deploy', 'replicas', 'voting app']
+---
+
+The `docker-stack.yml` file deploys the Example Voting App as a Docker Swarm stack using pre-built images from Docker Hub. This is suitable for testing multi-node or replicated deployments.
+
+<Warning>
+  Do not use `docker-stack.yml` with plain `docker compose up`. It defines multiple replicas that would attempt to bind to the same port, which fails outside of Swarm mode.
+</Warning>
+
+## Prerequisites
+
+- Docker Engine with Swarm mode available
+- An active swarm on the machine you are deploying from
+
+If you do not have a swarm initialized yet, create a single-node swarm:
+
+```bash
+docker swarm init
+```
+
+## Deploy the stack
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
+
+  <Step title="Deploy the stack">
+    ```bash
+    docker stack deploy --compose-file docker-stack.yml vote
+    ```
+
+    Docker pulls the published images and schedules all services across the swarm. The stack is named `vote`.
+  </Step>
+
+  <Step title="Verify the services are running">
+    ```bash
+    docker stack services vote
+    ```
+
+    Wait until the `REPLICAS` column matches the desired count for each service.
+  </Step>
+
+  <Step title="Open the app in your browser">
+    <CardGroup cols={2}>
+      <Card title="Vote" icon="check-square" href="http://localhost:8080">
+        Cast your vote at `http://localhost:8080`
+      </Card>
+      <Card title="Results" icon="chart-bar" href="http://localhost:8081">
+        View live results at `http://localhost:8081`
+      </Card>
+    </CardGroup>
+  </Step>
+</Steps>
+
+## Stack configuration
+
+### Compose file version
+
+`docker-stack.yml` is pinned to `version: "3.9"` rather than the Compose Spec used by `docker-compose.yml`. This is intentional — Docker Swarm does not currently support the Compose Spec format.
+
+### Services and images
+
+All application services use published images from Docker Hub:
+
+| Service  | Image                                        | Replicas | Port         |
+| -------- | -------------------------------------------- | -------- | ------------ |
+| `vote`   | `dockersamples/examplevotingapp_vote`         | 2        | `8080 → 80`  |
+| `result` | `dockersamples/examplevotingapp_result`       | 1        | `8081 → 80`  |
+| `worker` | `dockersamples/examplevotingapp_worker`       | 2        | —            |
+| `redis`  | `redis:alpine`                               | 1        | —            |
+| `db`     | `postgres:15-alpine`                         | 1        | —            |
+
+The `vote` and `worker` services each run 2 replicas for availability. Swarm's ingress routing mesh distributes incoming traffic across all replicas.
+
+### Networks
+
+| Network    | Connected services                    |
+| ---------- | ------------------------------------- |
+| `frontend` | `vote`, `redis`, `worker`             |
+| `backend`  | `result`, `db`, `worker`              |
+
+## Remove the stack
+
+To tear down all services, networks, and configurations created by the stack:
+
+```bash
+docker stack rm vote
+```
+
+<Note>
+  The `db-data` named volume is not removed by `docker stack rm`. Remove it manually with `docker volume rm vote_db-data` if you want to discard stored data.
+</Note>

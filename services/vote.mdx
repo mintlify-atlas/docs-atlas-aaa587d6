@@ -1,0 +1,189 @@
+---
+title: 'Vote'
+description: 'Python Flask web app that accepts votes from users and queues them in Redis.'
+icon: 'ballot-check'
+---
+
+The Vote service is the user-facing frontend of the voting application. It renders a ballot page where visitors choose between two configurable options and submits their selection into a Redis queue for the Worker to process.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Language" icon="python">
+    Python 3.11 with Flask
+  </Card>
+  <Card title="Web server" icon="server">
+    Gunicorn — 4 workers, port 80
+  </Card>
+  <Card title="Queue" icon="database">
+    Writes to Redis list `votes` via `rpush`
+  </Card>
+  <Card title="Port mapping" icon="network-wired">
+    Host `8080` → container `80`
+  </Card>
+</CardGroup>
+
+## Port mapping
+
+| Host port | Container port | Protocol |
+|-----------|---------------|----------|
+| 8080      | 80            | HTTP     |
+
+## Environment variables
+
+The two ballot options are fully configurable through environment variables.
+
+<ParamField path="env.OPTION_A" type="string" default="Cats">
+  Label for the first voting option, displayed on the ballot page.
+</ParamField>
+
+<ParamField path="env.OPTION_B" type="string" default="Dogs">
+  Label for the second voting option, displayed on the ballot page.
+</ParamField>
+
+```yaml docker-compose.yml
+vote:
+  build:
+    context: ./vote
+    target: dev
+  ports:
+    - "8080:80"
+  networks:
+    - front-tier
+    - back-tier
+```
+
+## How votes are stored
+
+When a user submits a vote via HTTP POST, `app.py` serialises the selection as a JSON string and appends it to the Redis list `votes` using `rpush`.
+
+```python app.py
+if request.method == 'POST':
+    redis = get_redis()
+    vote = request.form['vote']
+    app.logger.info('Received vote for %s', vote)
+    data = json.dumps({'voter_id': voter_id, 'vote': vote})
+    redis.rpush('votes', data)
+```
+
+Each entry in the list has the shape:
+
+```json
+{"voter_id": "<hex-64-bit-id>", "vote": "a"}
+```
+
+The Worker consumes entries from the left of this list with `lpop`.
+
+## Voter tracking
+
+The service enforces one vote per browser session using a cookie.
+
+```python app.py
+voter_id = request.cookies.get('voter_id')
+if not voter_id:
+    voter_id = hex(random.getrandbits(64))[2:-1]
+```
+
+- On the first visit, a random 64-bit hex value is generated and set as the `voter_id` cookie.
+- Subsequent requests read the existing cookie, ensuring the same browser always carries the same identity.
+- The Worker uses `voter_id` as the primary key for an `INSERT … ON CONFLICT → UPDATE` upsert, so changing your vote updates the existing record rather than adding a duplicate.
+
+<Note>
+  The one-vote-per-browser restriction is enforced by the Worker's upsert logic in PostgreSQL, not by the Vote service itself. The Vote service will push every POST to Redis regardless of whether the voter has voted before.
+</Note>
+
+## Redis connection
+
+The Flask app lazily creates a single Redis connection per request context and stores it on Flask's `g` object.
+
+```python app.py
+def get_redis():
+    if not hasattr(g, 'redis'):
+        g.redis = Redis(host="redis", db=0, socket_timeout=5)
+    return g.redis
+```
+
+The connection targets the hostname `redis` (the service name in Compose) with a 5-second socket timeout.
+
+## Dependencies
+
+```text requirements.txt
+Flask
+Redis
+gunicorn
+```
+
+| Package   | Role                                         |
+|-----------|----------------------------------------------|
+| Flask     | HTTP routing and templating                  |
+| Redis     | Python client for the Redis queue            |
+| gunicorn  | Production WSGI server (4 workers, port 80)  |
+
+## Dockerfile — multi-stage build
+
+The Dockerfile defines three stages so the same image source supports both local development and production deployment.
+
+```dockerfile vote/Dockerfile
+# base defines a base stage that uses the official python runtime base image
+FROM python:3.11-slim AS base
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/local/app
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# dev defines a stage for development, where it'll watch for filesystem changes
+FROM base AS dev
+RUN pip install watchdog
+ENV FLASK_ENV=development
+CMD ["python", "app.py"]
+
+# final defines the stage that will bundle the application for production
+FROM base AS final
+COPY . .
+EXPOSE 80
+CMD ["gunicorn", "app:app", "-b", "0.0.0.0:80", "--log-file", "-", \
+     "--access-logfile", "-", "--workers", "4", "--keep-alive", "0"]
+```
+
+| Stage   | Based on | Purpose                                          |
+|---------|----------|--------------------------------------------------|
+| `base`  | `python:3.11-slim` | Installs `curl` and Python dependencies |
+| `dev`   | `base`   | Adds `watchdog` for hot-reload; runs `python app.py` |
+| `final` | `base`   | Production image; runs Gunicorn with 4 workers   |
+
+<Tip>
+  The `docker-compose.yml` builds the `dev` target by default (`target: dev`), which mounts the local `./vote` directory as a volume so code changes are reflected without rebuilding the image.
+</Tip>
+
+## Health check
+
+Docker Compose defines a health check that polls the service's HTTP endpoint:
+
+```yaml docker-compose.yml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost"]
+  interval: 15s
+  timeout: 5s
+  retries: 3
+  start_period: 10s
+```
+
+| Parameter      | Value | Description                              |
+|----------------|-------|------------------------------------------|
+| `interval`     | 15s   | Time between checks                      |
+| `timeout`      | 5s    | Maximum time allowed for a single check  |
+| `retries`      | 3     | Failures before the container is marked unhealthy |
+| `start_period` | 10s   | Grace period after container start       |
+
+`curl` is installed in the `base` stage specifically to support this check.
+
+## Networks
+
+The Vote service is attached to both Compose networks:
+
+- **front-tier** — reachable from the host and the seed data service.
+- **back-tier** — required to reach the `redis` service.

@@ -1,0 +1,121 @@
+---
+title: 'Seed data'
+description: 'Pre-populate the Example Voting App database with sample votes for testing and demos using the seed service.'
+keywords: ['seed data', 'sample votes', 'testing', 'demo', 'apache bench']
+---
+
+The `seed` service pre-populates the voting database with 3,000 sample votes. It is useful when you want to demonstrate the result dashboard with realistic data or run tests against a pre-loaded state without clicking through the vote UI manually.
+
+## Overview
+
+<Columns cols={2}>
+  <Card title="3,000 votes generated" icon="chart-bar">
+    2,000 votes for option A and 1,000 votes for option B, submitted via Apache Bench.
+  </Card>
+  <Card title="Runs once" icon="circle-check">
+    The service has `restart: "no"` and exits after seeding. It will not re-run on subsequent `docker compose up` calls.
+  </Card>
+</Columns>
+
+## How to run the seed service
+
+The seed service is gated behind the `seed` [Compose profile](https://docs.docker.com/compose/how-tos/profiles/). It will not start unless you explicitly include the profile.
+
+<Steps>
+  <Step title="Start the full stack with the seed profile">
+    ```bash
+    docker compose --profile seed up -d
+    ```
+
+    Compose starts all regular services plus the `seed` service. The seed service waits for the `vote` service to be healthy before it runs.
+  </Step>
+  <Step title="Check that seeding completed">
+    ```bash
+    docker compose logs seed
+    ```
+
+    You should see Apache Bench output for three batches of requests. Once all three complete, the container exits.
+  </Step>
+  <Step title="Open the result dashboard">
+    Navigate to [http://localhost:8081](http://localhost:8081) to see the pre-populated results.
+  </Step>
+</Steps>
+
+## What the seed service does
+
+The seed service is built from the `./seed-data` directory. At image build time, `make-data.py` generates two URL-encoded POST body files:
+
+```python make-data.py
+# this creates urlencode-friendly files without EOL
+import urllib.parse
+
+outfile = open('postb', 'w')
+params = ({ 'vote': 'b' })
+encoded = urllib.parse.urlencode(params)
+outfile.write(encoded)
+outfile.close()
+
+outfile = open('posta', 'w')
+params = ({ 'vote': 'a' })
+encoded = urllib.parse.urlencode(params)
+outfile.write(encoded)
+outfile.close()
+```
+
+- `posta` — contains `vote=a` (vote for option A)
+- `postb` — contains `vote=b` (vote for option B)
+
+At runtime, `generate-votes.sh` uses [Apache Bench](https://httpd.apache.org/docs/2.4/programs/ab.html) (`ab`) to submit the votes in three batches:
+
+```shell generate-votes.sh
+#!/bin/sh
+
+# create 3000 votes (2000 for option a, 1000 for option b)
+ab -n 1000 -c 50 -p posta -T "application/x-www-form-urlencoded" http://vote/
+ab -n 1000 -c 50 -p postb -T "application/x-www-form-urlencoded" http://vote/
+ab -n 1000 -c 50 -p posta -T "application/x-www-form-urlencoded" http://vote/
+```
+
+| Batch | File    | Votes submitted | Concurrency | Running total for A | Running total for B |
+|-------|---------|-----------------|-------------|---------------------|---------------------|
+| 1     | `posta` | 1,000           | 50          | 1,000               | 0                   |
+| 2     | `postb` | 1,000           | 50          | 1,000               | 1,000               |
+| 3     | `posta` | 1,000           | 50          | 2,000               | 1,000               |
+
+The `-c 50` flag sends 50 concurrent requests per batch, which exercises the app's concurrency handling.
+
+<Note>
+  Because the vote app assigns a random `voter_id` cookie per HTTP client, Apache Bench counts as a single voter across all requests in each batch. The result dashboard de-duplicates votes per voter, so the actual result counts may differ from the raw POST totals depending on how the worker processes the queue.
+</Note>
+
+## Compose configuration
+
+```yaml docker-compose.yml
+# this service runs once to seed the database with votes
+# it won't run unless you specify the "seed" profile
+# docker compose --profile seed up -d
+seed:
+  build: ./seed-data
+  profiles: ["seed"]
+  depends_on:
+    vote:
+      condition: service_healthy
+  networks:
+    - front-tier
+  restart: "no"
+```
+
+Key points:
+
+- **`profiles: ["seed"]`** — The service is excluded from a plain `docker compose up`. You must pass `--profile seed` to include it.
+- **`depends_on: vote: condition: service_healthy`** — The seed service will not start until the vote service passes its health check, ensuring the HTTP endpoint is ready to receive POST requests.
+- **`restart: "no"`** — The container exits after the three `ab` batches complete and is not restarted. Running `docker compose up` again will not re-seed the database.
+- **`networks: front-tier`** — The seed service connects to the same front-tier network as the vote service so it can reach `http://vote/` by service name.
+
+<Warning>
+  Running the seed service against an already-populated database will add votes on top of existing data. If you need a clean state, reset the database volume first:
+
+  ```bash
+  docker compose down -v && docker compose --profile seed up -d
+  ```
+</Warning>

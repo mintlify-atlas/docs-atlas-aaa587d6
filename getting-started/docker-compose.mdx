@@ -1,0 +1,118 @@
+---
+title: 'Docker Compose'
+description: 'Run the Example Voting App locally for development using Docker Compose.'
+keywords: ['docker compose', 'local development', 'hot reload', 'voting app']
+---
+
+Docker Compose is the fastest way to get the Example Voting App running on your local machine. It builds all services from source and mounts your local code into the containers for hot-reload during development.
+
+## Prerequisites
+
+<Tabs>
+  <Tab title="Mac / Windows">
+    Install [Docker Desktop](https://www.docker.com/products/docker-desktop). Docker Compose is bundled automatically.
+  </Tab>
+  <Tab title="Linux">
+    Install [Docker Engine](https://docs.docker.com/engine/install/) and then install the latest version of the [Compose plugin](https://docs.docker.com/compose/install/).
+  </Tab>
+</Tabs>
+
+## Run the app
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
+
+  <Step title="Build and start all services">
+    From the repository root, run:
+
+    ```bash
+    docker compose up
+    ```
+
+    This builds images for the `vote`, `result`, and `worker` services, pulls `redis:alpine` and `postgres:15-alpine`, and starts everything. The first build may take a few minutes.
+  </Step>
+
+  <Step title="Open the app in your browser">
+    Once all services are healthy, open:
+
+    <CardGroup cols={2}>
+      <Card title="Vote" icon="check-square" href="http://localhost:8080">
+        Cast your vote at `http://localhost:8080`
+      </Card>
+      <Card title="Results" icon="chart-bar" href="http://localhost:8081">
+        View live results at `http://localhost:8081`
+      </Card>
+    </CardGroup>
+
+    <Note>
+      The voting app only accepts one vote per client browser. Additional votes from the same browser are not registered.
+    </Note>
+  </Step>
+</Steps>
+
+## Development workflow
+
+### Hot-reload with the dev profile
+
+The `docker-compose.yml` file uses the `dev` build target for the `vote` service and mounts your local source directories into the running containers:
+
+| Service  | Volume mount                    | Behavior                                              |
+| -------- | ------------------------------- | ----------------------------------------------------- |
+| `vote`   | `./vote:/usr/local/app`         | `watchdog` restarts the Flask app on file changes     |
+| `result` | `./result:/usr/local/app`       | `nodemon` restarts the Node.js server on file changes |
+
+Edit any file inside `./vote` or `./result` and the corresponding service restarts automatically — no rebuild required.
+
+<Tip>
+  The `result` service also exposes a Node.js inspector on `127.0.0.1:9229` so you can attach a debugger from your IDE.
+</Tip>
+
+### Seeding data
+
+A `seed` service is included but disabled by default. Run it with the `seed` profile to populate the database with sample votes:
+
+```bash
+docker compose --profile seed up -d
+```
+
+The seed container runs once and exits (`restart: "no"`). It depends on the `vote` service being healthy before sending data.
+
+## Multi-stage Dockerfile (vote service)
+
+The `vote/Dockerfile` uses three stages to keep development and production images separate:
+
+| Stage   | Base                | What it adds                                      | Command                                      |
+| ------- | ------------------- | ------------------------------------------------- | -------------------------------------------- |
+| `base`  | `python:3.11-slim`  | `curl` (for healthchecks), Python dependencies    | —                                            |
+| `dev`   | `base`              | `watchdog` for hot-reload, `FLASK_ENV=development`| `python app.py`                              |
+| `final` | `base`              | Application source code, port 80 exposed          | `gunicorn app:app -b 0.0.0.0:80 --workers 4` |
+
+The `docker-compose.yml` explicitly targets the `dev` stage:
+
+```yaml
+vote:
+  build:
+    context: ./vote
+    target: dev
+```
+
+The `final` stage is used when building a production image.
+
+## Stop the app
+
+Press `Ctrl+C` in the terminal running `docker compose up`, then remove containers and networks:
+
+```bash
+docker compose down
+```
+
+To also remove the named `db-data` volume (discards all stored votes):
+
+```bash
+docker compose down --volumes
+```

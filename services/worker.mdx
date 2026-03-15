@@ -1,0 +1,236 @@
+---
+title: 'Worker'
+description: '.NET C# background service that dequeues votes from Redis and persists them to PostgreSQL.'
+icon: 'gears'
+---
+
+The Worker is a headless background service with no HTTP interface. It acts as the bridge between the Redis queue and the PostgreSQL database: it continuously polls Redis for new votes, deserialises them, and upserts each one into the `votes` table.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Language" icon="code">
+    C# on .NET 7 (`net7.0`)
+  </Card>
+  <Card title="Input" icon="database">
+    Redis list `votes` — polled via `ListLeftPopAsync`
+  </Card>
+  <Card title="Output" icon="database">
+    PostgreSQL `votes` table — upsert per voter
+  </Card>
+  <Card title="Ports" icon="ban">
+    None — back-tier network only
+  </Card>
+</CardGroup>
+
+## Processing loop
+
+The main loop runs indefinitely. It sleeps 100 ms between iterations to avoid a CPU spike, then attempts to pop one item from the Redis list.
+
+```csharp Program.cs
+var definition = new { vote = "", voter_id = "" };
+while (true)
+{
+    // Slow down to prevent CPU spike, only query each 100ms
+    Thread.Sleep(100);
+
+    // Reconnect redis if down
+    if (redisConn == null || !redisConn.IsConnected) {
+        Console.WriteLine("Reconnecting Redis");
+        redisConn = OpenRedisConnection("redis");
+        redis = redisConn.GetDatabase();
+    }
+    string json = redis.ListLeftPopAsync("votes").Result;
+    if (json != null)
+    {
+        var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+        Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
+        // Reconnect DB if down
+        if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
+        {
+            Console.WriteLine("Reconnecting DB");
+            pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+        }
+        else
+        {
+            UpdateVote(pgsql, vote.voter_id, vote.vote);
+        }
+    }
+    else
+    {
+        keepAliveCommand.ExecuteNonQuery();
+    }
+}
+```
+
+When no vote is available (`json == null`), the worker issues a `SELECT 1` keep-alive query to prevent the PostgreSQL connection from timing out.
+
+## Upsert logic
+
+Each voter is identified by their `voter_id`. The Worker tries an `INSERT` first; if a row with that `id` already exists, a `DbException` is caught and an `UPDATE` is issued instead — effectively allowing voters to change their choice.
+
+```csharp Program.cs
+private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
+{
+    var command = connection.CreateCommand();
+    try
+    {
+        command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+        command.Parameters.AddWithValue("@id", voterId);
+        command.Parameters.AddWithValue("@vote", vote);
+        command.ExecuteNonQuery();
+    }
+    catch (DbException)
+    {
+        command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+        command.ExecuteNonQuery();
+    }
+    finally
+    {
+        command.Dispose();
+    }
+}
+```
+
+## Database schema
+
+When the Worker first connects to PostgreSQL it creates the `votes` table if it does not already exist:
+
+```sql
+CREATE TABLE IF NOT EXISTS votes (
+    id   VARCHAR(255) NOT NULL UNIQUE,
+    vote VARCHAR(255) NOT NULL
+)
+```
+
+| Column | Type           | Constraints        | Description                          |
+|--------|----------------|--------------------|--------------------------------------|
+| `id`   | `VARCHAR(255)` | `NOT NULL UNIQUE`  | Voter identifier (hex 64-bit cookie) |
+| `vote` | `VARCHAR(255)` | `NOT NULL`         | Vote value: `a` or `b`               |
+
+The `UNIQUE` constraint on `id` is what causes the `INSERT` to fail when a voter changes their vote, triggering the `UPDATE` fallback path.
+
+## Reconnection logic
+
+### Redis
+
+The Worker resolves the `redis` hostname to an IP address before connecting (a workaround for a known StackExchange.Redis issue) and retries indefinitely on `RedisConnectionException`.
+
+```csharp Program.cs
+private static ConnectionMultiplexer OpenRedisConnection(string hostname)
+{
+    var ipAddress = GetIp(hostname);
+    Console.WriteLine($"Found redis at {ipAddress}");
+
+    while (true)
+    {
+        try
+        {
+            Console.Error.WriteLine("Connecting to redis");
+            return ConnectionMultiplexer.Connect(ipAddress);
+        }
+        catch (RedisConnectionException)
+        {
+            Console.Error.WriteLine("Waiting for redis");
+            Thread.Sleep(1000);
+        }
+    }
+}
+```
+
+### PostgreSQL
+
+Similarly, `OpenDbConnection` retries indefinitely on both `SocketException` and `DbException`, sleeping 1 second between attempts.
+
+```csharp Program.cs
+private static NpgsqlConnection OpenDbConnection(string connectionString)
+{
+    NpgsqlConnection connection;
+
+    while (true)
+    {
+        try
+        {
+            connection = new NpgsqlConnection(connectionString);
+            connection.Open();
+            break;
+        }
+        catch (SocketException)
+        {
+            Console.Error.WriteLine("Waiting for db");
+            Thread.Sleep(1000);
+        }
+        catch (DbException)
+        {
+            Console.Error.WriteLine("Waiting for db");
+            Thread.Sleep(1000);
+        }
+    }
+    // ...
+}
+```
+
+## Dependencies
+
+```xml Worker.csproj
+<ItemGroup>
+  <PackageReference Include="StackExchange.Redis" Version="2.2.4" />
+  <PackageReference Include="Npgsql"             Version="4.1.9" />
+  <PackageReference Include="Newtonsoft.Json"    Version="13.0.1" />
+</ItemGroup>
+```
+
+| Package               | Version | Role                                         |
+|-----------------------|---------|----------------------------------------------|
+| `StackExchange.Redis` | 2.2.4   | Redis client (`ListLeftPopAsync`, connection multiplexer) |
+| `Npgsql`              | 4.1.9   | PostgreSQL ADO.NET driver                    |
+| `Newtonsoft.Json`     | 13.0.1  | JSON deserialisation of vote messages        |
+
+## Dockerfile — multi-stage build
+
+```dockerfile worker/Dockerfile
+# build compiles the program for the builder's local platform
+FROM --platform=${BUILDPLATFORM} mcr.microsoft.com/dotnet/sdk:7.0 AS build
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG BUILDPLATFORM
+
+WORKDIR /source
+COPY *.csproj .
+RUN dotnet restore -a $TARGETARCH
+
+COPY . .
+RUN dotnet publish -c release -o /app -a $TARGETARCH --self-contained false --no-restore
+
+# app image
+FROM mcr.microsoft.com/dotnet/runtime:7.0
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "Worker.dll"]
+```
+
+| Stage   | Image                              | Purpose                                     |
+|---------|------------------------------------|---------------------------------------------|
+| `build` | `mcr.microsoft.com/dotnet/sdk:7.0` | Restores NuGet packages and publishes binary |
+| final   | `mcr.microsoft.com/dotnet/runtime:7.0` | Minimal runtime-only image             |
+
+<Note>
+  The build stage uses `--platform=${BUILDPLATFORM}` so that cross-compilation targets (e.g., `linux/arm64`) work correctly on amd64 hosts. dotnet does not support QEMU-based emulation for builds or execution.
+</Note>
+
+## Networks
+
+The Worker is attached to the `back-tier` network only. It has no publicly reachable ports.
+
+```yaml docker-compose.yml
+worker:
+  build:
+    context: ./worker
+  depends_on:
+    redis:
+      condition: service_healthy
+    db:
+      condition: service_healthy
+  networks:
+    - back-tier
+```

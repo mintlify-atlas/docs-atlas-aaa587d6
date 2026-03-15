@@ -1,0 +1,161 @@
+---
+title: 'Configuration'
+description: 'Environment variables, network topology, volume configuration, and port mappings for the Example Voting App.'
+keywords: ['configuration', 'environment variables', 'ports', 'networks', 'volumes']
+---
+
+This page covers all configurable settings for the Example Voting App, including environment variables, network topology, volume setup, and port mappings across Docker Compose and Kubernetes deployments.
+
+## Environment variables
+
+### Vote service
+
+<ParamField path="OPTION_A" type="string" default="Cats">
+  Label for the first vote option. Displayed on the vote UI button and tracked in results as option `a`.
+</ParamField>
+
+<ParamField path="OPTION_B" type="string" default="Dogs">
+  Label for the second vote option. Displayed on the vote UI button and tracked in results as option `b`.
+</ParamField>
+
+### Result service
+
+<ParamField path="PORT" type="number" default="4000">
+  Internal port the result Node.js app listens on. The Compose file maps this to external port `8081`. You rarely need to change this.
+</ParamField>
+
+### Database service (`db`)
+
+<ParamField path="POSTGRES_USER" type="string" default="postgres">
+  PostgreSQL superuser name. Must match the credentials used by the worker service when it connects to the database.
+</ParamField>
+
+<ParamField path="POSTGRES_PASSWORD" type="string" default="postgres">
+  PostgreSQL superuser password.
+</ParamField>
+
+<Warning>
+  The default credentials (`postgres`/`postgres`) are intentionally simple for local development. Change these before deploying to any shared or production environment.
+</Warning>
+
+## Customizing vote options
+
+Override `OPTION_A` and `OPTION_B` to replace the default Cats vs. Dogs choices with any two options you like.
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Add an `environment` block to the `vote` service in `docker-compose.yml`:
+
+    ```yaml docker-compose.yml
+    services:
+      vote:
+        build:
+          context: ./vote
+          target: dev
+        environment:
+          OPTION_A: "Tabs"
+          OPTION_B: "Spaces"
+        depends_on:
+          redis:
+            condition: service_healthy
+        ports:
+          - "8080:80"
+        networks:
+          - front-tier
+          - back-tier
+    ```
+  </Tab>
+  <Tab title="Kubernetes">
+    Add `env` entries to the vote Deployment spec:
+
+    ```yaml
+    containers:
+      - name: vote
+        image: dockersamples/examplevotingapp_vote
+        env:
+          - name: OPTION_A
+            value: "Tabs"
+          - name: OPTION_B
+            value: "Spaces"
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  After changing vote options, restart the vote service for the new labels to appear in the UI. The result service will automatically display whichever labels the vote service sends.
+</Tip>
+
+## Port mappings
+
+| Service | Internal port | External port (Compose) | External port (Kubernetes) |
+|---------|--------------|------------------------|----------------------------|
+| vote    | 80           | 8080                   | 31000 (NodePort)           |
+| result  | 80 (4000)    | 8081                   | 31001 (NodePort)           |
+| result  | 9229 (debug) | 127.0.0.1:9229         | —                          |
+
+<Note>
+  The result debug port (`9229`) is bound to `127.0.0.1` in Compose, so it is only reachable from the local machine. It is not exposed in the Swarm stack or Kubernetes manifests.
+</Note>
+
+## Network configuration
+
+The app uses two isolated networks so that the public-facing services are separated from the internal data tier.
+
+<Tabs>
+  <Tab title="Docker Compose">
+    | Network      | Services attached                    | Purpose                          |
+    |--------------|--------------------------------------|----------------------------------|
+    | `front-tier` | vote, result, seed                   | Public-facing web traffic        |
+    | `back-tier`  | vote, result, worker, redis, db      | Internal service communication   |
+
+    ```yaml docker-compose.yml
+    networks:
+      front-tier:
+      back-tier:
+    ```
+
+    The `vote` and `result` services attach to **both** networks so they can serve HTTP traffic while also communicating with Redis and PostgreSQL on the back tier.
+  </Tab>
+  <Tab title="Docker Swarm">
+    The Swarm stack (`docker-stack.yml`) uses the same two-network model but with different names:
+
+    | Network    | Services attached              | Purpose                        |
+    |------------|--------------------------------|--------------------------------|
+    | `frontend` | redis, vote, worker            | Public-facing and vote ingress |
+    | `backend`  | db, result, worker             | Database and result tier       |
+
+    ```yaml docker-stack.yml
+    networks:
+      frontend:
+      backend:
+    ```
+  </Tab>
+</Tabs>
+
+## Volume configuration
+
+A single named volume provides persistence for PostgreSQL data.
+
+```yaml docker-compose.yml
+volumes:
+  db-data:
+```
+
+The `db` service mounts this volume at `/var/lib/postgresql/data`:
+
+```yaml
+db:
+  image: postgres:15-alpine
+  volumes:
+    - "db-data:/var/lib/postgresql/data"
+```
+
+<Note>
+  Votes are stored durably in PostgreSQL. The Redis queue holds in-flight votes before the worker processes them, but Redis data is not persisted across container restarts.
+</Note>
+
+To reset all vote data, remove the named volume:
+
+```bash
+docker compose down -v
+```

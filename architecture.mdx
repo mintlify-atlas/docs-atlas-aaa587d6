@@ -1,0 +1,163 @@
+---
+title: 'Architecture'
+description: 'How the five services of the Example Voting App connect and communicate.'
+keywords: ['architecture', 'services', 'docker', 'redis', 'postgres', 'network']
+---
+
+The Example Voting App is a simple distributed application composed of five services written in three different languages. It demonstrates how to connect a queue, a persistent datastore, and multiple web frontends inside Docker.
+
+<Note>
+This app is intentionally simple. It is not an example of a production-ready distributed system — it illustrates the basic building blocks (queues, persistent data, multiple runtimes) and how Docker ties them together.
+</Note>
+
+## Services
+
+<CardGroup cols={2}>
+  <Card title="vote" icon="check">
+    A Python/Flask web app that presents two voting options to the user. On submission it serialises the vote as JSON and pushes it onto a Redis list named `votes`.
+  </Card>
+  <Card title="redis" icon="database">
+    An in-memory data store (`redis:alpine`) used as a message queue. The `votes` list acts as the channel between the vote app and the worker.
+  </Card>
+  <Card title="worker" icon="gear">
+    A .NET console app that continuously pops messages from the Redis `votes` list and upserts them into the PostgreSQL `votes` table.
+  </Card>
+  <Card title="db" icon="server">
+    A PostgreSQL 15 database (`postgres:15-alpine`) that durably stores one row per voter. Its data is persisted in a named Docker volume (`db-data`).
+  </Card>
+  <Card title="result" icon="chart-bar">
+    A Node.js/Express web app that reads vote tallies from PostgreSQL every second and pushes live updates to connected browsers over Socket.IO.
+  </Card>
+</CardGroup>
+
+## Data flow
+
+<Steps>
+  <Step title="User opens the vote app">
+    A browser navigates to the `vote` service. The app reads the `OPTION_A` and `OPTION_B` environment variables (defaulting to `"Cats"` and `"Dogs"`) and renders the ballot. A random 64-bit `voter_id` is assigned and stored in a cookie so that each browser can only submit one vote.
+  </Step>
+  <Step title="Vote is pushed to Redis">
+    When the user submits the form, `vote/app.py` serialises the selection as a JSON object and calls `redis.rpush('votes', data)`:
+
+    ```python
+    data = json.dumps({'voter_id': voter_id, 'vote': vote})
+    redis.rpush('votes', data)
+    ```
+
+    The vote lands on the right end of the `votes` list in Redis.
+  </Step>
+  <Step title="Worker consumes the queue">
+    The .NET worker polls Redis every 100 ms using `ListLeftPopAsync("votes")`. Each message it receives is deserialised and passed to `UpdateVote`:
+
+    ```csharp
+    string json = redis.ListLeftPopAsync("votes").Result;
+    if (json != null)
+    {
+        var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+        UpdateVote(pgsql, vote.voter_id, vote.vote);
+    }
+    ```
+  </Step>
+  <Step title="Vote is upserted into PostgreSQL">
+    `UpdateVote` attempts an `INSERT`. If the voter has already voted (unique constraint on `id`), it falls back to an `UPDATE`:
+
+    ```csharp
+    command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+    // on DbException (duplicate key):
+    command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+    ```
+
+    This ensures each `voter_id` has exactly one row in the table.
+  </Step>
+  <Step title="Result app reads tallies">
+    The Node.js result service connects to PostgreSQL and runs the following query once per second:
+
+    ```javascript
+    client.query(
+      'SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote',
+      [],
+      function(err, result) { ... }
+    );
+    ```
+
+    The aggregated scores are broadcast to all connected browsers via `io.sockets.emit("scores", ...)` using Socket.IO.
+  </Step>
+  <Step title="Browser receives live results">
+    The result app's front end listens for `scores` events over the Socket.IO connection and updates the vote counts in real time — no page reload required.
+  </Step>
+</Steps>
+
+## Database schema
+
+The worker creates the `votes` table on first connection if it does not already exist:
+
+```sql
+CREATE TABLE IF NOT EXISTS votes (
+    id    VARCHAR(255) NOT NULL UNIQUE,
+    vote  VARCHAR(255) NOT NULL
+);
+```
+
+| Column | Type          | Constraint      | Description                          |
+|--------|---------------|-----------------|--------------------------------------|
+| `id`   | `VARCHAR(255)`| `NOT NULL UNIQUE` | The voter's cookie ID — one row per browser. |
+| `vote` | `VARCHAR(255)`| `NOT NULL`      | The selected option (`a` or `b`).    |
+
+Because `id` has a `UNIQUE` constraint, changing your vote overwrites the existing row rather than inserting a second one.
+
+## Network topology
+
+Services are segregated across two Docker networks to limit exposure:
+
+| Network | Services attached |
+|---------|-------------------|
+| `front-tier` | `vote`, `result` |
+| `back-tier` | `vote`, `result`, `worker`, `redis`, `db` |
+
+The `vote` and `result` services sit on both networks so they can serve browser traffic while still reaching the back-tier services. The `worker`, `redis`, and `db` services are on `back-tier` only and are not directly reachable from the internet.
+
+<Note>
+In the Docker Swarm stack (`docker-stack.yml`) the networks are named `frontend` and `backend` instead of `front-tier` and `back-tier`, but the same isolation principle applies.
+</Note>
+
+## Port mappings
+
+### Docker Compose
+
+| Service | Host port | Container port | Purpose |
+|---------|-----------|----------------|---------|
+| `vote`  | `8080`    | `80`           | Voting ballot UI |
+| `result`| `8081`    | `80`           | Live results UI |
+| `result`| `127.0.0.1:9229` | `9229` | Node.js inspector (dev only) |
+
+### Kubernetes (NodePort)
+
+| Service  | Service port | Target port | NodePort | Type |
+|----------|-------------|-------------|----------|------|
+| `vote`   | `8080`      | `80`        | `31000`  | `NodePort` |
+| `result` | `8081`      | `80`        | `31001`  | `NodePort` |
+| `redis`  | `6379`      | `6379`      | —        | `ClusterIP` |
+| `db`     | `5432`      | `5432`      | —        | `ClusterIP` |
+
+After deploying to Kubernetes, the vote app is available on port **31000** and the result app on port **31001** on every node in the cluster:
+
+```shell
+kubectl create -f k8s-specifications/
+```
+
+## Service dependencies (Docker Compose)
+
+Docker Compose `depends_on` with health-check conditions ensures services start in a safe order:
+
+| Service  | Waits for            | Condition          |
+|----------|----------------------|--------------------|
+| `vote`   | `redis`              | `service_healthy`  |
+| `result` | `db`                 | `service_healthy`  |
+| `worker` | `redis`, `db`        | `service_healthy` (both) |
+| `seed`   | `vote`               | `service_healthy`  |
+
+Both `redis` and `db` define custom health-check scripts mounted from the `./healthchecks` directory. The vote service additionally publishes its own health check on `http://localhost` so the optional `seed` service can wait for it.
+
+<Note>
+The `seed` service is only activated when you run with the `seed` profile: `docker compose --profile seed up -d`. It submits sample votes and then exits (`restart: "no"`).
+</Note>

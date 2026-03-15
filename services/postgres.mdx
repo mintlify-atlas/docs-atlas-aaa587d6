@@ -1,0 +1,131 @@
+---
+title: 'PostgreSQL'
+description: 'Persistent relational database that stores the final tally of processed votes.'
+icon: 'database'
+---
+
+PostgreSQL is the durable storage layer of the voting application. It holds the canonical `votes` table, which the Worker populates and the Result service queries. All data survives container restarts thanks to a named Docker volume.
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="Image" icon="box">
+    `postgres:15-alpine`
+  </Card>
+  <Card title="Volume" icon="hard-drive">
+    `db-data:/var/lib/postgresql/data`
+  </Card>
+  <Card title="Schema" icon="table">
+    `votes` table — created by the Worker
+  </Card>
+  <Card title="Network" icon="network-wired">
+    `back-tier` only
+  </Card>
+</CardGroup>
+
+## Environment variables
+
+<ParamField path="env.POSTGRES_USER" type="string" default="postgres">
+  Superuser account name created on first startup. Used by both the Worker and the Result service to authenticate.
+</ParamField>
+
+<ParamField path="env.POSTGRES_PASSWORD" type="string" default="postgres">
+  Password for the superuser account. Both the Worker (`Server=db;Username=postgres;Password=postgres;`) and Result service (`postgres://postgres:postgres@db/postgres`) use this value.
+</ParamField>
+
+<Warning>
+  The default credentials (`postgres` / `postgres`) are intentionally simple for local development. Change these values and use Docker secrets or environment injection before deploying to any shared or production environment.
+</Warning>
+
+## Configuration
+
+```yaml docker-compose.yml
+db:
+  image: postgres:15-alpine
+  environment:
+    POSTGRES_USER: "postgres"
+    POSTGRES_PASSWORD: "postgres"
+  volumes:
+    - "db-data:/var/lib/postgresql/data"
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/postgres.sh
+    interval: "5s"
+  networks:
+    - back-tier
+
+volumes:
+  db-data:
+```
+
+## Volume
+
+| Volume name | Mount path                    | Purpose                             |
+|-------------|-------------------------------|-------------------------------------|
+| `db-data`   | `/var/lib/postgresql/data`    | Persists database files across restarts |
+
+The `db-data` named volume is declared at the top level of `docker-compose.yml`. Docker manages its lifecycle independently of the container — data is retained when the container is stopped, restarted, or recreated.
+
+## Schema
+
+The `votes` table is not created by an init script. Instead, the Worker creates it automatically when it first connects to the database:
+
+```sql
+CREATE TABLE IF NOT EXISTS votes (
+    id   VARCHAR(255) NOT NULL UNIQUE,
+    vote VARCHAR(255) NOT NULL
+)
+```
+
+| Column | Type           | Constraints       | Description                                    |
+|--------|----------------|-------------------|------------------------------------------------|
+| `id`   | `VARCHAR(255)` | `NOT NULL UNIQUE` | Voter identifier from the browser cookie       |
+| `vote` | `VARCHAR(255)` | `NOT NULL`        | Vote value: `a` (Option A) or `b` (Option B)   |
+
+The `UNIQUE` constraint on `id` enforces the one-vote-per-voter rule at the database level. Submitting a second vote triggers an `UPDATE` in the Worker rather than a duplicate `INSERT`.
+
+## Health check
+
+The health check mounts `healthchecks/` into the container and runs `postgres.sh` every 5 seconds.
+
+```bash healthchecks/postgres.sh
+#!/bin/bash
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+user="${POSTGRES_USER:-postgres}"
+db="${POSTGRES_DB:-$POSTGRES_USER}"
+export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+
+args=(
+    --host "$host"
+    --username "$user"
+    --dbname "$db"
+    --quiet --no-align --tuples-only
+)
+
+if select="$(echo 'SELECT 1' | psql "${args[@]}")" && [ "$select" = '1' ]; then
+    exit 0
+fi
+
+exit 1
+```
+
+The script uses `psql` to execute `SELECT 1` against the database over a TCP connection (using the container's IP address, not the Unix socket), confirming that PostgreSQL is accepting queries — not just that the process is running.
+
+| Parameter  | Value | Description                |
+|------------|-------|----------------------------|
+| `interval` | 5s    | Time between health checks |
+
+<Tip>
+  Both the Worker and Result services declare `depends_on: db: condition: service_healthy`, so they will not start until this check passes.
+</Tip>
+
+## Networks
+
+PostgreSQL is on the `back-tier` network only. It is reachable by:
+
+- **Worker** — connects via hostname `db`, port 5432 (default)
+- **Result service** — connects via connection string `postgres://postgres:postgres@db/postgres`
+
+It is not accessible from the `front-tier` network or directly from the host.
