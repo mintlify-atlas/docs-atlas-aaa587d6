@@ -1,0 +1,57 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Example Voting App",
+  "projectDescription": "A simple distributed voting application composed of multiple Docker containers, demonstrating multi-service orchestration with Docker Compose, Docker Swarm, and Kubernetes.",
+  "theme": "aspen",
+  "primaryColor": "#1c63ec",
+  "lightColor": "#8cb4f4",
+  "darkColor": "#04143c",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["introduction", "architecture"]
+          },
+          {
+            "group": "Getting Started",
+            "pages": ["getting-started/docker-compose", "getting-started/docker-swarm", "getting-started/kubernetes"]
+          },
+          {
+            "group": "Services",
+            "pages": ["services/vote", "services/result", "services/worker", "services/redis", "services/postgres"]
+          },
+          {
+            "group": "Operations",
+            "pages": ["operations/configuration", "operations/healthchecks", "operations/seed-data"]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-container distributed application across 5 services",
+    "Docker Compose support for local development",
+    "Docker Swarm stack deployment with horizontal scaling",
+    "Kubernetes deployment manifests for production clusters",
+    "Real-time vote results via WebSocket (Socket.IO)",
+    "Multi-language stack: Python (Flask), Node.js, .NET (C#)",
+    "Redis message queue for vote ingestion",
+    "PostgreSQL persistent storage for vote counts",
+    "Multi-stage Dockerfiles for dev and production builds",
+    "Configurable vote options via environment variables"
+  ],
+  "publicApiSurface": [
+    "Vote web app — HTTP GET/POST http://localhost:8080 (Docker Compose) or :31000 (Kubernetes)",
+    "Result web app — HTTP GET http://localhost:8081 (Docker Compose) or :31001 (Kubernetes)",
+    "Result WebSocket — Socket.IO 'scores' event emitted every 1s with vote counts",
+    "Environment variable OPTION_A — sets first vote option label (default: Cats)",
+    "Environment variable OPTION_B — sets second vote option label (default: Dogs)",
+    "docker compose up — starts all services locally",
+    "docker stack deploy --compose-file docker-stack.yml vote — deploys to Docker Swarm",
+    "kubectl create -f k8s-specifications/ — deploys to Kubernetes",
+    "docker compose --profile seed up -d — seeds the database with sample votes"
+  ]
+}
